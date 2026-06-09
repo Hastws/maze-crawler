@@ -560,12 +560,20 @@ class Dispatcher:
                     return p[0]
 
         # ── P5: Proactive North Progression ──
+        # Try pathfinding to a northward target
         tgt = (r.col, min(r.row + 3, gs.north))
         p = astar_path(gs, r.pos, tgt, optimistic=True)
         if p:
             s, _ = self.is_safe(r, p[0], set())
             if s:
                 return p[0]
+
+        # If stuck (can't pathfind north), try JUMP to cross walls
+        if r.jump_cd == 0:
+            for j in ("JUMP_NORTH", "JUMP_EAST", "JUMP_WEST"):
+                s, _ = self.is_safe(r, j, set())
+                if s:
+                    return j
 
         # Last resort: if we can move north, do it
         s_n, _ = self.is_safe(r, A_NORTH, set())
@@ -583,7 +591,24 @@ class Dispatcher:
         counts = {t: sum(1 for r in gs.my.values() if r.type == t)
                    for t in (1, 2, 3)}
 
-        # Phase 1: Core trifecta
+        # Phase 1: Aggressive early-game expansion
+        # Turn 0-20: build core units quickly  
+        if gs.step <= 20:
+            if counts[1] == 0 and f.energy >= cfg.scoutCost + 50:
+                return "BUILD_SCOUT"
+            if counts[1] >= 1 and counts[2] == 0 and f.energy >= cfg.workerCost + 50:
+                return "BUILD_WORKER"
+            if counts[2] >= 1 and counts[3] == 0 and f.energy >= cfg.minerCost + 50 and gs.nodes:
+                return "BUILD_MINER"
+            # Extra scouts/workers in early game
+            if counts[1] < 2 and f.energy >= cfg.scoutCost + 150:
+                return "BUILD_SCOUT"
+            if counts[2] < 2 and f.energy >= cfg.workerCost + 100:
+                return "BUILD_WORKER"
+            if counts[3] < 1 and f.energy >= cfg.minerCost + 100 and gs.nodes:
+                return "BUILD_MINER"
+
+        # Phase 2: Core trifecta (post-early-game)
         if counts[1] == 0 and f.energy >= cfg.scoutCost + 200:
             return "BUILD_SCOUT"
         if counts[2] == 0 and f.energy >= cfg.workerCost + 250:
@@ -632,10 +657,17 @@ class Dispatcher:
         if act:
             return act
 
-        # Northward exploration
-        tgt = (r.col, min(r.row + 8, gs.north))
-        p = astar_path(gs, r.pos, tgt, optimistic=True)
-        return p[0] if p else A_NORTH
+        # Northward exploration — push further and wider
+        # Try multiple target columns at varying distances
+        for tr in (r.row + 12, r.row + 8, r.row + 5):
+            for tc in (r.col, r.col - 3, r.col + 3, gs.width // 2):
+                tc = max(0, min(gs.width - 1, tc))
+                tgt = (tc, min(tr, gs.north))
+                if tgt[1] > r.row:
+                    p = astar_path(gs, r.pos, tgt, optimistic=True, limit=200)
+                    if p:
+                        return p[0]
+        return A_NORTH
 
     # ─── Worker Logic ───────────────────────────────────────
 
@@ -692,22 +724,56 @@ class Dispatcher:
                 if p:
                     return p[0]
 
-        # Wall removal for factory path
-        if r.energy > 150 and f:
-            for dr, dc, dir_name in [
-                (1, 0, "REMOVE_NORTH"), (-1, 0, "REMOVE_SOUTH"),
-                (0, 1, "REMOVE_EAST"), (0, -1, "REMOVE_WEST"),
-            ]:
-                tp = (r.col + dc, r.row + dr)
-                is_fp = (f.col == tp[0] and tp[1] > f.row and tp[1] <= f.row + 4)
-                near_f = gs.manhattan(tp, f.pos) < gs.manhattan(r.pos, f.pos)
-                if is_fp or near_f:
+        # Wall removal: clear ALL walls blocking the factory's path
+        if r.energy > 120 and f:
+            # Priority 1: Remove walls BETWEEN worker and factory (clear path for scout/miner too)
+            for d in DIRS:
+                nxt = gs.step_pos(r.pos, d)
+                if nxt == f.pos:
                     w = gs.walls.get(r.pos, 0)
-                    bit = {"NORTH": 1, "EAST": 2, "SOUTH": 4, "WEST": 8}[
-                        dir_name.split("_")[1]
-                    ]
+                    bit = DIR_BIT[d]
                     if w & bit:
-                        return dir_name
+                        opp = {"NORTH": "SOUTH", "SOUTH": "NORTH", "EAST": "WEST", "WEST": "EAST"}[d]
+                        return f"REMOVE_{opp}" if d in ("NORTH", "SOUTH") else f"REMOVE_{d}"
+
+            # Priority 2: Clear walls in factory's column (NORTH of factory, up to 5 rows)
+            for rr in range(f.row, min(f.row + 5, gs.north + 1)):
+                cell = (f.col, rr)
+                if cell in gs.walls:
+                    w = gs.walls[cell]
+                    if w & NORTH:
+                        if r.pos == cell:
+                            return "REMOVE_NORTH"
+                        p = astar_path(gs, r.pos, cell, limit=20)
+                        if p:
+                            return p[0]
+
+            # Priority 3: Clear lateral walls near factory (allow factory to move EAST/WEST)
+            for c_off in (-1, 1):
+                nc = f.col + c_off
+                if 0 <= nc < gs.width:
+                    for rr in range(f.row, min(f.row + 3, gs.north + 1)):
+                        cell = (nc, rr)
+                        if cell in gs.walls:
+                            w = gs.walls[cell]
+                            if w & NORTH:
+                                if r.pos == cell:
+                                    return "REMOVE_NORTH"
+                                p = astar_path(gs, r.pos, cell, limit=15)
+                                if p:
+                                    return p[0]
+
+            # Priority 4: Clear walls in worker's own column northward
+            for rr in range(r.row, min(r.row + 5, gs.north + 1)):
+                cell = (r.col, rr)
+                if cell in gs.walls:
+                    w = gs.walls[cell]
+                    if w & NORTH:
+                        if r.pos == cell:
+                            return "REMOVE_NORTH"
+                        p = astar_path(gs, r.pos, cell, limit=20)
+                        if p:
+                            return p[0]
 
         # Collect
         act = self._collect(r, intent, max_ratio=0.85)
