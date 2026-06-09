@@ -74,6 +74,8 @@ class GameState:
         self.risk = np.zeros((1000, self.width), dtype=np.float32)
         self.enemy_history: Dict[str, Tuple[int, int]] = {}
         self.path_cache: Dict[Tuple, List[str]] = {}
+        self.prev_factory_row: int = -1
+        self.stuck_counter: int = 0
 
     def update(self, obs: Any):
         self.step = obs.step
@@ -148,6 +150,15 @@ class GameState:
             c, r = map(int, s.split(','))
             if r >= self.south:
                 self.mines[(c, r)] = data
+
+        # Track factory stuck detection
+        my_f = self.my.get(next((uid for uid, r in self.my.items() if r.type == T_FACTORY), ""), None)
+        if my_f:
+            if my_f.row == self.prev_factory_row:
+                self.stuck_counter += 1
+            else:
+                self.stuck_counter = max(0, self.stuck_counter - 1)
+            self.prev_factory_row = my_f.row
 
     def in_bounds(self, pos: Tuple[int, int]) -> bool:
         c, r = pos
@@ -473,8 +484,14 @@ class Dispatcher:
         death = r.row - gs.south
         buffer = 12 + (gs.step // 40)
 
+        # ── P-1: First-turn wall skip ──
+        if gs.step <= 3 and r.jump_cd == 0 and gs.has_wall(r.pos, "NORTH"):
+            s_j, _ = self.is_safe(r, "JUMP_NORTH", set())
+            if s_j:
+                return "JUMP_NORTH"
+
         # ── P0: Panic Escape ──
-        if death < buffer:
+        if death < buffer or gs.stuck_counter >= 3:
             if r.jump_cd == 0:
                 for j in ("JUMP_NORTH", "JUMP_EAST", "JUMP_WEST"):
                     s, _ = self.is_safe(r, j, set())
@@ -591,29 +608,35 @@ class Dispatcher:
         counts = {t: sum(1 for r in gs.my.values() if r.type == t)
                    for t in (1, 2, 3)}
 
-        # Phase 1: Aggressive early-game expansion
-        # Turn 0-20: build core units quickly  
-        if gs.step <= 20:
+        have_nodes = bool(gs.nodes)
+
+        # Phase 1: Aggressive early-game expansion (turn 0-15)
+        if gs.step <= 15:
+            # ALWAYS build scout first — vision is critical
             if counts[1] == 0 and f.energy >= cfg.scoutCost + 50:
                 return "BUILD_SCOUT"
+            # Then worker to clear walls
             if counts[1] >= 1 and counts[2] == 0 and f.energy >= cfg.workerCost + 50:
                 return "BUILD_WORKER"
-            if counts[2] >= 1 and counts[3] == 0 and f.energy >= cfg.minerCost + 50 and gs.nodes:
+            # Miner ONLY if we can see nodes
+            if counts[2] >= 1 and counts[3] == 0 and f.energy >= cfg.minerCost + 50 and have_nodes:
                 return "BUILD_MINER"
-            # Extra scouts/workers in early game
-            if counts[1] < 2 and f.energy >= cfg.scoutCost + 150:
+            # Second scout for wider exploration
+            if counts[1] < 2 and f.energy >= cfg.scoutCost + 100:
                 return "BUILD_SCOUT"
-            if counts[2] < 2 and f.energy >= cfg.workerCost + 100:
+            # Second worker if walls detected
+            if counts[2] < 2 and f.energy >= cfg.workerCost + 100 and _has_walls_near_factory(gs, f):
                 return "BUILD_WORKER"
-            if counts[3] < 1 and f.energy >= cfg.minerCost + 100 and gs.nodes:
+            # Miner if nodes discovered
+            if counts[3] < 1 and f.energy >= cfg.minerCost + 100 and have_nodes:
                 return "BUILD_MINER"
 
-        # Phase 2: Core trifecta (post-early-game)
-        if counts[1] == 0 and f.energy >= cfg.scoutCost + 200:
+        # Phase 2: Post-early-game expansion
+        if counts[1] == 0 and f.energy >= cfg.scoutCost + 150:
             return "BUILD_SCOUT"
-        if counts[2] == 0 and f.energy >= cfg.workerCost + 250:
+        if counts[2] == 0 and f.energy >= cfg.workerCost + 200:
             return "BUILD_WORKER"
-        if counts[3] == 0 and f.energy >= cfg.minerCost + 300:
+        if counts[3] == 0 and f.energy >= cfg.minerCost + 250 and have_nodes:
             return "BUILD_MINER"
 
         # Phase 2: Dynamic scaling
@@ -657,14 +680,15 @@ class Dispatcher:
         if act:
             return act
 
-        # Northward exploration — push further and wider
-        # Try multiple target columns at varying distances
-        for tr in (r.row + 12, r.row + 8, r.row + 5):
-            for tc in (r.col, r.col - 3, r.col + 3, gs.width // 2):
+        # Northward exploration — push hard north, wide search
+        # Early game: push to north edge to reveal map
+        push_dist = 20 if gs.step <= 30 else 12
+        for tr in (r.row + push_dist, r.row + 12, r.row + 8, r.row + 5):
+            for tc in (r.col, r.col - 4, r.col + 4, gs.width // 2, 0, gs.width - 1):
                 tc = max(0, min(gs.width - 1, tc))
                 tgt = (tc, min(tr, gs.north))
                 if tgt[1] > r.row:
-                    p = astar_path(gs, r.pos, tgt, optimistic=True, limit=200)
+                    p = astar_path(gs, r.pos, tgt, optimistic=True, limit=300)
                     if p:
                         return p[0]
         return A_NORTH
@@ -830,6 +854,22 @@ class Dispatcher:
                 return p[0]
 
         return A_IDLE
+
+
+# ═══════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════
+
+def _has_walls_near_factory(gs: GameState, f: Robot) -> bool:
+    """Check if there are removable walls in a 5-row window above the factory."""
+    for rr in range(f.row, min(f.row + 5, gs.north + 1)):
+        for cc in range(max(0, f.col - 2), min(gs.width, f.col + 3)):
+            cell = (cc, rr)
+            if cell in gs.walls:
+                w = gs.walls[cell]
+                if w & NORTH and not gs.is_fixed_wall(cell, "NORTH"):
+                    return True
+    return False
 
 
 # ═══════════════════════════════════════
