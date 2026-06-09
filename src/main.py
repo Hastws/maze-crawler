@@ -173,7 +173,9 @@ class GameState:
 
     def has_wall(self, pos: Tuple[int, int], d: str) -> bool:
         val = self.walls.get(pos)
-        return val is not None and bool(val & DIR_BIT[d])
+        if val is None:
+            return False  # unknown → assume no wall (needed for exploration)
+        return bool(val & DIR_BIT[d])
 
     def get_neighbors(self, pos: Tuple[int, int],
                        optimistic: bool = False) -> List[Tuple[Tuple[int, int], str]]:
@@ -364,7 +366,9 @@ class Dispatcher:
                 # Fallback: find best safe alternative
                 death_dist = r.row - self.gs.south
                 order = {A_NORTH: 0, A_EAST: 1, A_WEST: 1, A_IDLE: 2, A_SOUTH: 3}
-                cands = self.gs.get_neighbors(r.pos)
+                # Use optimistic neighbors if current cell is unknown (fog)
+                known = r.pos in self.gs.walls
+                cands = self.gs.get_neighbors(r.pos, optimistic=not known)
                 if death_dist < 5:
                     cands = [c for c in cands if c[1] != A_SOUTH]
                 found = False
@@ -484,29 +488,35 @@ class Dispatcher:
         death = r.row - gs.south
         buffer = 12 + (gs.step // 40)
 
-        # ── P-1: First-turn wall skip ──
-        if gs.step <= 3 and r.jump_cd == 0 and gs.has_wall(r.pos, "NORTH"):
-            s_j, _ = self.is_safe(r, "JUMP_NORTH", set())
-            if s_j:
-                return "JUMP_NORTH"
+        # ── P-1: First-turn wall skip / unknown cell escape ──
+        if gs.step <= 3 and r.jump_cd == 0:
+            # Check if we're in a dangerous spot: wall north OR unknown cell
+            in_unknown = r.pos not in gs.walls
+            if gs.has_wall(r.pos, "NORTH") or in_unknown:
+                s_j, _ = self.is_safe(r, "JUMP_NORTH", set())
+                if s_j:
+                    return "JUMP_NORTH"
 
         # ── P0: Panic Escape ──
         if death < buffer or gs.stuck_counter >= 3:
             if r.jump_cd == 0:
                 for j in ("JUMP_NORTH", "JUMP_EAST", "JUMP_WEST"):
-                    s, _ = self.is_safe(r, j, set())
-                    if s:
-                        return j
-                s, _ = self.is_safe(r, A_NORTH, set())
-                if s:
-                    return A_NORTH
+                    jp = self.predict(r, j)
+                    if gs.in_bounds(jp):
+                        s, _ = self.is_safe(r, j, set())
+                        if s:
+                            return j
+            s, _ = self.is_safe(r, A_NORTH, set())
+            if s:
+                return A_NORTH
 
-            # Escape pathfinding
+            # Escape pathfinding (use optimistic for unknown cells)
+            in_unknown = r.pos not in gs.walls
             for tr in (r.row + 10, r.row + 5):
                 for tc in (r.col, gs.width // 2, 0, gs.width - 1):
                     tgt = (max(0, min(gs.width - 1, tc)), min(gs.north, tr))
                     if tgt[1] > r.row:
-                        p = astar_path(gs, r.pos, tgt, limit=1000)
+                        p = astar_path(gs, r.pos, tgt, limit=1000, optimistic=in_unknown)
                         if p and p[0] != A_SOUTH:
                             return p[0]
 
