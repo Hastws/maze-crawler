@@ -76,7 +76,7 @@ class GameState:
         self.path_cache: Dict[Tuple, List[str]] = {}
 
     def update(self, obs: Any):
-        self.step = obs.get('step', 0)
+        self.step = obs.step
         self.player = obs.player
         self.south = obs.southBound
         self.north = obs.northBound
@@ -493,11 +493,14 @@ class Dispatcher:
                         if p and p[0] != A_SOUTH:
                             return p[0]
 
-            # Emergency: build worker to break walls
-            if r.energy >= 200 and r.build_cd == 0:
-                s, _ = self.is_safe(r, A_NORTH, set())
-                if not s:
-                    return "BUILD_WORKER"
+            # Emergency: build worker or scout to break walls / explore
+            if r.build_cd == 0:
+                s_north, _ = self.is_safe(r, A_NORTH, set())
+                if not s_north:
+                    if r.energy >= 200:
+                        return "BUILD_WORKER"
+                    elif r.energy >= 50:
+                        return "BUILD_SCOUT"
 
             # Greedy safe NORTH push
             best, max_r = A_NORTH, -1
@@ -564,7 +567,11 @@ class Dispatcher:
             if s:
                 return p[0]
 
-        return A_NORTH if gs.step % 4 == 0 else A_IDLE
+        # Last resort: if we can move north, do it
+        s_n, _ = self.is_safe(r, A_NORTH, set())
+        if s_n:
+            return A_NORTH
+        return A_IDLE
 
     def _build(self, f: Robot) -> Optional[str]:
         gs = self.gs
