@@ -1,17 +1,16 @@
-"""Maze Crawler Agent v2 — Risk-Aware A* + Combat Micro + Wolf-Pack Trapping.
+"""Maze Crawler Agent v3 — Economy-First Survival + Risk-Aware A*.
 
-A high-performance agent combining the best strategies:
-- Risk matrix (numpy) for boundary + enemy avoidance
-- A* pathfinding with asymmetric cost weights (NORTH cheap, SOUTH expensive)
-- Combat micro (offensive crushing + tactical kiting)
-- Wolf-pack trapping (workers predict & wall-in enemy factory)
-- Dynamic economic scaling with aggressive build caps
-- Centralized safety checking (walls, bounds, collisions, danger zones)
-- Persistent wall/mine/node memory across turns
+Key strategy (based on top-player replay analysis and meta-lessons):
+1. SURVIVE: Risk matrix + A* keeps factory ahead of south boundary
+2. ECONOMY: Aggressive mine deployment -> passive energy income
+3. COLLECT: Systematic crystal + mine energy harvesting
+4. TRANSFER: Route all energy to factory for tiebreak wins
+5. SIMPLIFY: Remove bad defaults (per Jiayi Du's meta-lesson)
+
+Avoids blind jumps into unknown dead-ends, prefers known-path exploration.
 """
 
-import random
-import heapq
+import random, heapq
 import numpy as np
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -20,9 +19,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # ═══════════════════════════════════════
 
 NORTH, EAST, SOUTH, WEST = 1, 2, 4, 8
-A_NORTH = "NORTH"; A_EAST = "EAST"; A_SOUTH = "SOUTH"; A_WEST = "WEST"; A_IDLE = "IDLE"
+A_N = "NORTH"; A_E = "EAST"; A_S = "SOUTH"; A_W = "WEST"; A_IDLE = "IDLE"
 T_FACTORY, T_SCOUT, T_WORKER, T_MINER = 0, 1, 2, 3
-
 CRUSH = {T_FACTORY: 4, T_MINER: 3, T_WORKER: 2, T_SCOUT: 1}
 
 DIR_BIT = {"NORTH": 1, "EAST": 2, "SOUTH": 4, "WEST": 8}
@@ -30,80 +28,58 @@ DIR_DELTA = {"NORTH": (0, 1), "EAST": (1, 0), "SOUTH": (0, -1), "WEST": (-1, 0)}
 DIRS = ("NORTH", "EAST", "SOUTH", "WEST")
 
 # ═══════════════════════════════════════
-# Robot Data (slots for speed)
+# Robot Data
 # ═══════════════════════════════════════
 
 class Robot:
     __slots__ = ('uid', 'type', 'col', 'row', 'energy', 'owner',
                  'move_cd', 'jump_cd', 'build_cd', 'power')
     def __init__(self, uid: str, data: List[int]):
-        self.uid = uid
-        self.type = data[0]
+        self.uid = uid; self.type = data[0]
         self.col, self.row = data[1], data[2]
-        self.energy = data[3]
-        self.owner = data[4]
+        self.energy = data[3]; self.owner = data[4]
         self.move_cd = data[5] if len(data) > 5 else 0
         self.jump_cd = data[6] if len(data) > 6 else 0
         self.build_cd = data[7] if len(data) > 7 else 0
         self.power = CRUSH.get(self.type, 0)
 
     @property
-    def pos(self) -> Tuple[int, int]:
-        return (self.col, self.row)
-
+    def pos(self) -> Tuple[int, int]: return (self.col, self.row)
 
 # ═══════════════════════════════════════
-# Game State (persistent across turns)
+# Game State
 # ═══════════════════════════════════════
 
 class GameState:
     def __init__(self, config: Any):
-        self.config = config
-        self.width = config.width
-        self.height = config.height
+        self.config = config; self.width = config.width; self.height = config.height
         self.walls: Dict[Tuple[int, int], int] = {}
         self.nodes: Set[Tuple[int, int]] = set()
         self.mines: Dict[Tuple[int, int], List[int]] = {}
         self.crystals: Dict[Tuple[int, int], int] = {}
-        self.my: Dict[str, Robot] = {}
-        self.enemy: Dict[str, Robot] = {}
-        self.step = 0
-        self.player = 0
-        self.south = 0
-        self.north = 0
+        self.my: Dict[str, Robot] = {}; self.enemy: Dict[str, Robot] = {}
+        self.step = 0; self.player = 0; self.south = 0; self.north = 0
         self.risk = np.zeros((1000, self.width), dtype=np.float32)
         self.enemy_history: Dict[str, Tuple[int, int]] = {}
         self.path_cache: Dict[Tuple, List[str]] = {}
-        self.prev_factory_row: int = -1
-        self.stuck_counter: int = 0
 
     def update(self, obs: Any):
-        self.step = obs.step
-        self.player = obs.player
-        self.south = obs.southBound
-        self.north = obs.northBound
+        self.step = obs.step; self.player = obs.player
+        self.south = obs.southBound; self.north = obs.northBound
         w = self.width
+        self.crystals.clear(); self.my.clear(); self.enemy.clear()
+        self.risk.fill(0); self.path_cache.clear()
 
-        self.crystals.clear()
-        self.my.clear()
-        self.enemy.clear()
-        self.risk.fill(0)
-        self.path_cache.clear()
-
-        # Parse robots
         cur_enemy = {}
         for uid, data in obs.robots.items():
             r = Robot(uid, data)
-            if r.owner == self.player:
-                self.my[uid] = r
-            else:
-                self.enemy[uid] = r
-                cur_enemy[uid] = r.pos
+            if r.owner == self.player: self.my[uid] = r
+            else: self.enemy[uid] = r; cur_enemy[uid] = r.pos
 
-        # Risk matrix: boundary danger
+        # Risk matrix: exponential penalty near south boundary
         rows = np.arange(self.south, self.north + 1)
-        buffer = 12 + (self.step // 40)
-        penalties = np.maximum(0, buffer - (rows - self.south)) ** 2
+        buf = 12 + (self.step // 40)
+        penalties = np.maximum(0, buf - (rows - self.south)) ** 2
         valid = rows[rows < 1000]
         self.risk[valid, :] = penalties[:len(valid), np.newaxis]
 
@@ -114,16 +90,14 @@ class GameState:
                 c0, c1 = max(0, en.col - 3), min(w, en.col + 4)
                 for rr in range(r0, r1):
                     for cc in range(c0, c1):
-                        dist = abs(rr - en.row) + abs(cc - en.col)
-                        if dist <= 3:
-                            self.risk[rr, cc] += (4 - dist) * 15
+                        d = abs(rr - en.row) + abs(cc - en.col)
+                        if d <= 3: self.risk[rr, cc] += (4 - d) * 15
             else:
                 r0, r1 = max(0, en.row - 1), min(999, en.row + 2)
                 c0, c1 = max(0, en.col - 1), min(w, en.col + 2)
                 for rr in range(r0, r1):
                     for cc in range(c0, c1):
                         self.risk[rr, cc] += en.power * 5
-
         self.enemy_history = cur_enemy
 
         # Parse walls
@@ -131,116 +105,84 @@ class GameState:
             base = (row - self.south) * w
             for col in range(w):
                 val = obs.walls[base + col]
-                if val != -1:
-                    self.walls[(col, row)] = val
-
-        # Parse crystals
+                if val != -1: self.walls[(col, row)] = val
+        # Crystals
         for s, e in obs.crystals.items():
-            c, r = map(int, s.split(','))
-            self.crystals[(c, r)] = e
-
-        # Parse mining nodes
+            c, r = map(int, s.split(',')); self.crystals[(c, r)] = e
+        # Mining nodes
         for s in obs.miningNodes:
             c, r = map(int, s.split(','))
-            if r >= self.south:
-                self.nodes.add((c, r))
-
-        # Parse mines
+            if r >= self.south: self.nodes.add((c, r))
+        # Mines
         for s, data in obs.mines.items():
             c, r = map(int, s.split(','))
-            if r >= self.south:
-                self.mines[(c, r)] = data
-
-        # Track factory stuck detection
-        my_f = self.my.get(next((uid for uid, r in self.my.items() if r.type == T_FACTORY), ""), None)
-        if my_f:
-            if my_f.row == self.prev_factory_row:
-                self.stuck_counter += 1
-            else:
-                self.stuck_counter = max(0, self.stuck_counter - 1)
-            self.prev_factory_row = my_f.row
+            if r >= self.south: self.mines[(c, r)] = data
 
     def in_bounds(self, pos: Tuple[int, int]) -> bool:
-        c, r = pos
-        return 0 <= c < self.width and self.south <= r <= self.north
+        c, r = pos; return 0 <= c < self.width and self.south <= r <= self.north
 
     def step_pos(self, pos: Tuple[int, int], d: str) -> Tuple[int, int]:
-        dc, dr = DIR_DELTA[d]
-        return (pos[0] + dc, pos[1] + dr)
+        dc, dr = DIR_DELTA[d]; return (pos[0] + dc, pos[1] + dr)
 
     def manhattan(self, a: Tuple[int, int], b: Tuple[int, int]) -> int:
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
     def has_wall(self, pos: Tuple[int, int], d: str) -> bool:
         val = self.walls.get(pos)
-        if val is None:
-            return False  # unknown → assume no wall (needed for exploration)
-        return bool(val & DIR_BIT[d])
+        return val is not None and bool(val & DIR_BIT[d])
+
+    def is_fixed_wall(self, pos: Tuple[int, int], d: str) -> bool:
+        col, _ = pos; half = self.width // 2
+        if d == "WEST" and col == 0: return True
+        if d == "EAST" and col == self.width - 1: return True
+        if d == "EAST" and col == half - 1: return True
+        if d == "WEST" and col == half: return True
+        return False
 
     def get_neighbors(self, pos: Tuple[int, int],
                        optimistic: bool = False) -> List[Tuple[Tuple[int, int], str]]:
-        c, r = pos
-        nbrs = []
+        c, r = pos; nbrs = []
         w = self.walls.get(pos, -1)
         if w == -1:
-            if not optimistic:
-                return []
+            if not optimistic: return []
             w = 0
-        if not (w & NORTH) and r + 1 <= self.north:
-            nbrs.append(((c, r + 1), A_NORTH))
-        if not (w & EAST) and c + 1 < self.width:
-            nbrs.append(((c + 1, r), A_EAST))
-        if not (w & SOUTH) and r - 1 >= self.south:
-            nbrs.append(((c, r - 1), A_SOUTH))
-        if not (w & WEST) and c - 1 >= 0:
-            nbrs.append(((c - 1, r), A_WEST))
+        if not (w & NORTH) and r + 1 <= self.north: nbrs.append(((c, r + 1), A_N))
+        if not (w & EAST) and c + 1 < self.width: nbrs.append(((c + 1, r), A_E))
+        if not (w & SOUTH) and r - 1 >= self.south: nbrs.append(((c, r - 1), A_S))
+        if not (w & WEST) and c - 1 >= 0: nbrs.append(((c - 1, r), A_W))
         return nbrs
 
 
 # ═══════════════════════════════════════
-# A* Pathfinding with Risk Weights
+# A* Pathfinding
 # ═══════════════════════════════════════
 
 def astar_path(gs: GameState, start: Tuple[int, int], goal: Tuple[int, int], *,
-               optimistic: bool = False,
-               limit: int = 600) -> Optional[List[str]]:
-    if start == goal:
-        return []
+               optimistic: bool = False, limit: int = 600) -> Optional[List[str]]:
+    if start == goal: return []
     cache_key = (start, goal)
-    if not optimistic and cache_key in gs.path_cache:
-        return gs.path_cache[cache_key]
+    if not optimistic and cache_key in gs.path_cache: return gs.path_cache[cache_key]
 
     frontier = [(0, start)]
     came_from: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {start: None}
     act_from: Dict[Tuple[int, int], str] = {}
     cost_sofar: Dict[Tuple[int, int], float] = {start: 0.0}
-    evals = 0
-
-    best_node, best_dist = start, gs.manhattan(start, goal)
+    evals = 0; best_node, best_dist = start, gs.manhattan(start, goal)
 
     while frontier and evals < limit:
-        _, curr = heapq.heappop(frontier)
-        evals += 1
-
+        _, curr = heapq.heappop(frontier); evals += 1
         d = gs.manhattan(curr, goal)
-        if d < best_dist:
-            best_dist, best_node = d, curr
+        if d < best_dist: best_dist, best_node = d, curr
+        if curr == goal: break
 
-        if curr == goal:
-            break
-
-        c, r = curr
-        w = gs.walls.get(curr, -1)
+        c, r = curr; w = gs.walls.get(curr, -1)
         if w == -1:
-            if not optimistic:
-                continue
+            if not optimistic: continue
             w = 0
 
         for bit, dc, dr, act, base_cost in [
-            (NORTH, 0, 1, A_NORTH, 1),
-            (EAST, 1, 0, A_EAST, 3),
-            (SOUTH, 0, -1, A_SOUTH, 100),
-            (WEST, -1, 0, A_WEST, 3),
+            (NORTH, 0, 1, A_N, 1), (EAST, 1, 0, A_E, 3),
+            (SOUTH, 0, -1, A_S, 100), (WEST, -1, 0, A_W, 3),
         ]:
             if not (w & bit):
                 nc, nr = c + dc, r + dr
@@ -252,27 +194,19 @@ def astar_path(gs: GameState, start: Tuple[int, int], goal: Tuple[int, int], *,
                         cost_sofar[nxt] = new_cost
                         priority = new_cost + gs.manhattan(goal, nxt)
                         heapq.heappush(frontier, (priority, nxt))
-                        came_from[nxt] = curr
-                        act_from[nxt] = act
+                        came_from[nxt] = curr; act_from[nxt] = act
 
     target = goal if goal in came_from else best_node
-    if target == start:
-        return None
-
-    path = []
-    node = target
-    while node != start:
-        path.append(act_from[node])
-        node = came_from[node]
+    if target == start: return None
+    path = []; node = target
+    while node != start: path.append(act_from[node]); node = came_from[node]
     path.reverse()
-
-    if not optimistic and target == goal:
-        gs.path_cache[cache_key] = path
+    if not optimistic and target == goal: gs.path_cache[cache_key] = path
     return path
 
 
 # ═══════════════════════════════════════
-# Dispatcher — orchestrates all unit actions
+# Dispatcher
 # ═══════════════════════════════════════
 
 class Dispatcher:
@@ -282,7 +216,6 @@ class Dispatcher:
         self._compute_danger()
 
     def _compute_danger(self):
-        """Pre-compute cells dangerous to each power level."""
         self.danger = {1: set(), 2: set(), 3: set(), 4: set()}
         for en in self.gs.enemy.values():
             for p in range(1, en.power + 1):
@@ -296,15 +229,12 @@ class Dispatcher:
                     for d in DIRS:
                         dc, dr = DIR_DELTA[d]
                         jp = (en.col + 2 * dc, en.row + 2 * dr)
-                        if self.gs.in_bounds(jp):
-                            self.danger[p].add(jp)
+                        if self.gs.in_bounds(jp): self.danger[p].add(jp)
 
     def predict(self, r: Robot, action: str) -> Tuple[int, int]:
-        if action in DIRS:
-            return self.gs.step_pos(r.pos, action)
+        if action in DIRS: return self.gs.step_pos(r.pos, action)
         if action.startswith("JUMP_"):
-            d = action[5:]
-            dc, dr = DIR_DELTA[d]
+            d = action[5:]; dc, dr = DIR_DELTA[d]
             return (r.col + 2 * dc, r.row + 2 * dr)
         if action in ("BUILD_SCOUT", "BUILD_WORKER", "BUILD_MINER"):
             return (r.col, r.row + 1)
@@ -313,91 +243,56 @@ class Dispatcher:
     def is_safe(self, r: Robot, action: str,
                 reserved: Set[Tuple[int, int]]) -> Tuple[bool, Tuple[int, int]]:
         nxt = self.predict(r, action)
-
-        # Out of bounds
-        if not self.gs.in_bounds(nxt):
-            return False, r.pos
-
-        # Wall check for simple moves
+        if not self.gs.in_bounds(nxt): return False, r.pos
         if action in DIRS:
             w = self.gs.walls.get(r.pos, 0)
-            if action == A_NORTH and (w & 1):
-                return False, r.pos
-            if action == A_EAST and (w & 2):
-                return False, r.pos
-            if action == A_SOUTH and (w & 4):
-                return False, r.pos
-            if action == A_WEST and (w & 8):
-                return False, r.pos
-
-        # Already reserved by another unit
-        if nxt in reserved:
-            return False, r.pos
-
-        # Danger zone
-        if nxt in self.danger.get(r.power, set()):
-            return False, r.pos
-
+            if action == A_N and (w & 1): return False, r.pos
+            if action == A_E and (w & 2): return False, r.pos
+            if action == A_S and (w & 4): return False, r.pos
+            if action == A_W and (w & 8): return False, r.pos
+        if nxt in reserved: return False, r.pos
+        if nxt in self.danger.get(r.power, set()): return False, r.pos
         return True, nxt
 
     def disp(self) -> Dict[str, str]:
         actions: Dict[str, str] = {}
         reserved: Set[Tuple[int, int]] = set()
         intent: Set[Tuple[int, int]] = set()
-
         robots = sorted(self.gs.my.values(), key=lambda x: -x.power)
         factory = next((r for r in robots if r.type == T_FACTORY), None)
 
         for r in robots:
             try:
-                if r.type == T_FACTORY:
-                    act = self._factory(r)
-                elif r.type == T_SCOUT:
-                    act = self._scout(r, factory, intent)
-                elif r.type == T_WORKER:
-                    act = self._worker(r, factory, intent)
-                else:
-                    act = self._miner(r, intent)
-            except Exception:
-                act = A_NORTH
+                if r.type == T_FACTORY: act = self._factory(r)
+                elif r.type == T_SCOUT: act = self._scout(r, factory, intent)
+                elif r.type == T_WORKER: act = self._worker(r, factory, intent)
+                else: act = self._miner(r, intent)
+            except Exception: act = A_N
 
             safe, nxt = self.is_safe(r, act, reserved)
             if not safe:
-                # Fallback: find best safe alternative
                 death_dist = r.row - self.gs.south
-                order = {A_NORTH: 0, A_EAST: 1, A_WEST: 1, A_IDLE: 2, A_SOUTH: 3}
-                # Use optimistic neighbors if current cell is unknown (fog)
+                order = {A_N: 0, A_E: 1, A_W: 1, A_IDLE: 2, A_S: 3}
                 known = r.pos in self.gs.walls
                 cands = self.gs.get_neighbors(r.pos, optimistic=not known)
-                if death_dist < 5:
-                    cands = [c for c in cands if c[1] != A_SOUTH]
+                if death_dist < 5: cands = [c for c in cands if c[1] != A_S]
                 found = False
                 for _, cand in sorted(cands, key=lambda x: order.get(x[1], 4)):
                     s, n = self.is_safe(r, cand, reserved)
-                    if s:
-                        act, nxt, found = cand, n, True
-                        break
-                if not found:
-                    act, nxt = A_IDLE, r.pos
+                    if s: act, nxt, found = cand, n, True; break
+                if not found: act, nxt = A_IDLE, r.pos
 
-            actions[r.uid] = act
-            reserved.add(nxt)
-
+            actions[r.uid] = act; reserved.add(nxt)
         return actions
 
-    # ─── Combat Micro ───────────────────────────────────────
-
+    # ─── Combat Micro ───────────────────────
     def _combat_micro(self, r: Robot) -> Optional[str]:
         gs = self.gs
-        # Offensive: crush weaker adjacent enemies
         for nxt, act in gs.get_neighbors(r.pos):
             enemy = next((e for e in gs.enemy.values() if e.pos == nxt), None)
             if enemy and r.power > enemy.power:
                 s, _ = self.is_safe(r, act, set())
-                if s:
-                    return act
-
-        # Defensive: kite away from stronger enemies within 2 tiles
+                if s: return act
         hostiles = [e for e in gs.enemy.values()
                      if e.power > r.power and gs.manhattan(r.pos, e.pos) <= 2]
         if hostiles:
@@ -407,382 +302,224 @@ class Dispatcher:
                 s, nxt = self.is_safe(r, act, set())
                 if s:
                     nd = min(gs.manhattan(nxt, h.pos) for h in hostiles)
-                    if nd > best_min:
-                        best_min, best = nd, act
-            if best != A_IDLE:
-                return best
+                    if nd > best_min: best_min, best = nd, act
+            if best != A_IDLE: return best
         return None
 
-    # ─── Energy Transfer ────────────────────────────────────
-
+    # ─── Energy Transfer ────────────────────
     def _transfer(self, r: Robot, target: Optional[Robot]) -> Optional[str]:
-        if not target:
-            return None
-        if self.gs.manhattan(r.pos, target.pos) != 1:
-            return None
+        if not target: return None
+        if self.gs.manhattan(r.pos, target.pos) != 1: return None
         w = self.gs.walls.get(r.pos, 0)
-        if target.row > r.row and not (w & 1):
-            return "TRANSFER_NORTH"
-        if target.row < r.row and not (w & 4):
-            return "TRANSFER_SOUTH"
-        if target.col > r.col and not (w & 2):
-            return "TRANSFER_EAST"
-        if target.col < r.col and not (w & 8):
-            return "TRANSFER_WEST"
+        if target.row > r.row and not (w & 1): return "TRANSFER_NORTH"
+        if target.row < r.row and not (w & 4): return "TRANSFER_SOUTH"
+        if target.col > r.col and not (w & 2): return "TRANSFER_EAST"
+        if target.col < r.col and not (w & 8): return "TRANSFER_WEST"
         return None
 
-    # ─── Collection (crystals + mines + exploration) ────────
-
+    # ─── Collection ─────────────────────────
     def _collect(self, r: Robot, intent: Set[Tuple[int, int]],
                   max_ratio: float = 0.9) -> Optional[str]:
         gs = self.gs
         max_e = 100 if r.type == 1 else 300 if r.type == 2 else 500
-        if r.energy > max_e * max_ratio:
-            return None
+        if r.energy > max_e * max_ratio: return None
 
-        # Crystals
         avail = {pos: e for pos, e in gs.crystals.items() if pos not in intent}
-        # Friendly mines with energy
         m_avail = {pos: d[0] for pos, d in gs.mines.items()
                     if d[2] == gs.player and d[0] > 0 and pos not in intent}
-
         targets = []
         for pos, e in avail.items():
-            d = gs.manhattan(r.pos, pos)
-            targets.append((pos, e / (d * d + 1)))
+            d = gs.manhattan(r.pos, pos); targets.append((pos, e / (d * d + 1)))
         for pos, e in m_avail.items():
-            d = gs.manhattan(r.pos, pos)
-            targets.append((pos, min(e, 100) / (d * d + 1)))
-
+            d = gs.manhattan(r.pos, pos); targets.append((pos, min(e, 100) / (d * d + 1)))
         if targets:
             targets.sort(key=lambda x: -x[1])
-            best = targets[0][0]
-            intent.add(best)
-            if r.pos == best:
-                return A_IDLE
+            best = targets[0][0]; intent.add(best)
+            if r.pos == best: return A_IDLE
             path = astar_path(gs, r.pos, best, limit=300)
-            if path:
-                return path[0]
-
-        # Explore undiscovered cells (north-biased)
-        undiscovered = []
-        for rr in range(max(gs.south + 1, r.row - 2),
-                         min(gs.north + 1, r.row + 10)):
-            for cc in range(gs.width):
-                if (cc, rr) not in gs.walls and (cc, rr) not in intent:
-                    undiscovered.append((cc, rr))
-        if undiscovered:
-            undiscovered.sort(key=lambda c: gs.manhattan(r.pos, c))
-            idx = hash(r.uid) % min(len(undiscovered), 5)
-            closest = undiscovered[min(len(undiscovered) - 1, idx)]
-            intent.add(closest)
-            path = astar_path(gs, r.pos, closest, limit=150)
-            if path:
-                return path[0]
+            if path: return path[0]
         return None
 
-    # ─── Factory Logic ──────────────────────────────────────
-
+    # ─── Factory Logic ──────────────────────
     def _factory(self, r: Robot) -> str:
-        gs = self.gs
-        death = r.row - gs.south
-        buffer = 12 + (gs.step // 40)
+        gs = self.gs; death = r.row - gs.south
+        buf = 12 + (gs.step // 40)
 
-        # ── P-1: First-turn wall skip / unknown cell escape ──
-        if gs.step <= 3 and r.jump_cd == 0:
-            # Check if we're in a dangerous spot: wall north OR unknown cell
-            in_unknown = r.pos not in gs.walls
-            if gs.has_wall(r.pos, "NORTH") or in_unknown:
-                s_j, _ = self.is_safe(r, "JUMP_NORTH", set())
-                if s_j:
-                    return "JUMP_NORTH"
-
-        # ── P0: Panic Escape ──
-        if death < buffer or gs.stuck_counter >= 3:
+        # P0: Panic Escape
+        if death < buf:
             if r.jump_cd == 0:
                 for j in ("JUMP_NORTH", "JUMP_EAST", "JUMP_WEST"):
-                    jp = self.predict(r, j)
-                    if gs.in_bounds(jp):
+                    if gs.in_bounds(self.predict(r, j)):
                         s, _ = self.is_safe(r, j, set())
-                        if s:
-                            return j
-            s, _ = self.is_safe(r, A_NORTH, set())
-            if s:
-                return A_NORTH
-
-            # Escape pathfinding (use optimistic for unknown cells)
-            in_unknown = r.pos not in gs.walls
+                        if s: return j
+            s, _ = self.is_safe(r, A_N, set())
+            if s: return A_N
             for tr in (r.row + 10, r.row + 5):
                 for tc in (r.col, gs.width // 2, 0, gs.width - 1):
                     tgt = (max(0, min(gs.width - 1, tc)), min(gs.north, tr))
                     if tgt[1] > r.row:
-                        p = astar_path(gs, r.pos, tgt, limit=1000, optimistic=in_unknown)
-                        if p and p[0] != A_SOUTH:
-                            return p[0]
-
-            # Emergency: build worker or scout to break walls / explore
+                        p = astar_path(gs, r.pos, tgt, limit=1000)
+                        if p and p[0] != A_S: return p[0]
             if r.build_cd == 0:
-                s_north, _ = self.is_safe(r, A_NORTH, set())
-                if not s_north:
-                    if r.energy >= 200:
-                        return "BUILD_WORKER"
-                    elif r.energy >= 50:
-                        return "BUILD_SCOUT"
-
-            # Greedy safe NORTH push
-            best, max_r = A_NORTH, -1
+                s_n, _ = self.is_safe(r, A_N, set())
+                if not s_n:
+                    if r.energy >= 200: return "BUILD_WORKER"
+                    elif r.energy >= 50: return "BUILD_SCOUT"
+            best, max_r = A_N, -1
             for _, act in gs.get_neighbors(r.pos):
-                if act == A_SOUTH:
-                    continue
+                if act == A_S: continue
                 s, nxt = self.is_safe(r, act, set())
-                if s and nxt[1] > max_r:
-                    max_r, best = nxt[1], act
+                if s and nxt[1] > max_r: max_r, best = nxt[1], act
             return best
 
-        # ── P1: Offensive Jump Crush ──
+        # P1: Offensive Jump Crush
         if r.jump_cd == 0:
             for j in ("JUMP_NORTH", "JUMP_EAST", "JUMP_WEST"):
                 jp = self.predict(r, j)
-                if gs.in_bounds(jp):
-                    enemy_there = any(e.pos == jp and e.power < r.power
-                                      for e in gs.enemy.values())
-                    if enemy_there:
-                        s, _ = self.is_safe(r, j, set())
-                        if s:
-                            return j
+                if gs.in_bounds(jp) and any(e.pos == jp and e.power < r.power for e in gs.enemy.values()):
+                    s, _ = self.is_safe(r, j, set())
+                    if s: return j
 
-        # ── P2: Evade Enemy Factory ──
+        # P2: Evade Enemy Factory
         ef = next((e for e in gs.enemy.values() if e.type == T_FACTORY), None)
         if ef and gs.manhattan(r.pos, ef.pos) <= 3:
             best_d, best_dist = A_IDLE, gs.manhattan(r.pos, ef.pos)
             if r.jump_cd == 0:
                 for j in ("JUMP_NORTH", "JUMP_EAST", "JUMP_WEST"):
                     jp = self.predict(r, j)
-                    if gs.in_bounds(jp):
-                        nd = gs.manhattan(jp, ef.pos)
-                        if nd > best_dist:
-                            best_dist, best_d = nd, j
+                    if gs.in_bounds(jp) and gs.manhattan(jp, ef.pos) > best_dist:
+                        best_dist, best_d = gs.manhattan(jp, ef.pos), j
                 return best_d
             for _, act in gs.get_neighbors(r.pos):
                 s, nxt = self.is_safe(r, act, set())
-                if s:
-                    nd = gs.manhattan(nxt, ef.pos)
-                    if nd > best_dist:
-                        best_dist, best_d = nd, act
-            if best_d != A_IDLE:
-                return best_d
+                if s and gs.manhattan(nxt, ef.pos) > best_dist:
+                    best_dist, best_d = gs.manhattan(nxt, ef.pos), act
+            if best_d != A_IDLE: return best_d
 
-        # ── P3: Economic Build ──
+        # P3: Economy Build
         if r.build_cd == 0:
-            b = self._build(r)
-            if b:
-                return b
+            b = self._build_economy(r)
+            if b: return b
 
-        # ── P4: Centering ──
-        if death >= buffer:
-            tc = gs.width // 2
-            if abs(r.col - tc) > 1:
-                p = astar_path(gs, r.pos, (tc, r.row))
-                if p:
-                    return p[0]
+        # P4: Centering
+        if death >= buf and abs(r.col - gs.width // 2) > 1:
+            p = astar_path(gs, r.pos, (gs.width // 2, r.row))
+            if p: return p[0]
 
-        # ── P5: Proactive North Progression ──
-        # Try pathfinding to a northward target
+        # P5: Proactive North
         tgt = (r.col, min(r.row + 3, gs.north))
         p = astar_path(gs, r.pos, tgt, optimistic=True)
         if p:
             s, _ = self.is_safe(r, p[0], set())
-            if s:
-                return p[0]
+            if s: return p[0]
 
-        # If stuck (can't pathfind north), try JUMP to cross walls
-        if r.jump_cd == 0:
-            for j in ("JUMP_NORTH", "JUMP_EAST", "JUMP_WEST"):
-                s, _ = self.is_safe(r, j, set())
-                if s:
-                    return j
+        s_n, _ = self.is_safe(r, A_N, set())
+        return A_N if s_n else A_IDLE
 
-        # Last resort: if we can move north, do it
-        s_n, _ = self.is_safe(r, A_NORTH, set())
-        if s_n:
-            return A_NORTH
-        return A_IDLE
-
-    def _build(self, f: Robot) -> Optional[str]:
-        gs = self.gs
-        cfg = gs.config
+    def _build_economy(self, f: Robot) -> Optional[str]:
+        """Economy-focused build: scouts->vision, miners->passive income, workers->path clearing."""
+        gs = self.gs; cfg = gs.config
         spawn = (f.col, f.row + 1)
-        if not gs.in_bounds(spawn) or gs.has_wall(f.pos, "NORTH"):
-            return None
+        if not gs.in_bounds(spawn) or gs.has_wall(f.pos, "NORTH"): return None
 
-        counts = {t: sum(1 for r in gs.my.values() if r.type == t)
-                   for t in (1, 2, 3)}
+        counts = {t: sum(1 for r in gs.my.values() if r.type == t) for t in (1, 2, 3)}
+        have_nodes = bool(gs.nodes); gap = f.row - gs.south
 
-        have_nodes = bool(gs.nodes)
+        # Safety: don't build if barely surviving
+        if gap < 5 and f.energy < cfg.minerCost + 200: return None
 
-        # Phase 1: Aggressive early-game expansion (turn 0-15)
-        if gs.step <= 15:
-            # ALWAYS build scout first — vision is critical
-            if counts[1] == 0 and f.energy >= cfg.scoutCost + 50:
-                return "BUILD_SCOUT"
-            # Then worker to clear walls
-            if counts[1] >= 1 and counts[2] == 0 and f.energy >= cfg.workerCost + 50:
-                return "BUILD_WORKER"
-            # Miner ONLY if we can see nodes
-            if counts[2] >= 1 and counts[3] == 0 and f.energy >= cfg.minerCost + 50 and have_nodes:
-                return "BUILD_MINER"
-            # Second scout for wider exploration
-            if counts[1] < 2 and f.energy >= cfg.scoutCost + 100:
-                return "BUILD_SCOUT"
-            # Second worker if walls detected
-            if counts[2] < 2 and f.energy >= cfg.workerCost + 100 and _has_walls_near_factory(gs, f):
-                return "BUILD_WORKER"
-            # Miner if nodes discovered
-            if counts[3] < 1 and f.energy >= cfg.minerCost + 100 and have_nodes:
-                return "BUILD_MINER"
+        # Scout first (vision unlocks everything)
+        if counts[1] == 0 and f.energy >= cfg.scoutCost + 100: return "BUILD_SCOUT"
 
-        # Phase 2: Post-early-game expansion
-        if counts[1] == 0 and f.energy >= cfg.scoutCost + 150:
-            return "BUILD_SCOUT"
-        if counts[2] == 0 and f.energy >= cfg.workerCost + 200:
-            return "BUILD_WORKER"
-        if counts[3] == 0 and f.energy >= cfg.minerCost + 250 and have_nodes:
+        # Worker for walls
+        if counts[2] == 0 and f.energy >= cfg.workerCost + 150:
+            if self._walls_blocking_factory(f): return "BUILD_WORKER"
+
+        # Miners = passive economy (up to 3)
+        if counts[3] < 3 and f.energy >= cfg.minerCost + 200 and have_nodes:
             return "BUILD_MINER"
 
-        # Phase 2: Dynamic scaling
-        min_e = min(800, 400 + len(gs.my) * 50)
-        if f.energy > min_e:
-            max_miners = 4 if f.energy > 600 else 2
-            max_workers = 5 if f.energy > 700 else 3
-            max_scouts = 6 if f.energy > 500 else 4
+        # More scouts for wider vision
+        if counts[1] < 2 and f.energy >= cfg.scoutCost + 300: return "BUILD_SCOUT"
 
-            if counts[3] < max_miners and f.energy > 400:
-                return "BUILD_MINER"
-            if counts[2] < max_workers and f.energy > 400:
-                return "BUILD_WORKER"
-            if counts[1] < max_scouts and f.energy > 200:
-                return "BUILD_SCOUT"
+        # Extra worker if still blocked
+        if counts[2] < 2 and f.energy >= cfg.workerCost + 300:
+            if self._walls_blocking_factory(f): return "BUILD_WORKER"
+
+        # Late game: hoard energy
+        if gs.step > 400: return None
+
+        # Rich: expand economy further
+        if counts[3] < 4 and f.energy >= cfg.minerCost + 400 and have_nodes:
+            return "BUILD_MINER"
+        if counts[1] < 3 and f.energy >= cfg.scoutCost + 500: return "BUILD_SCOUT"
         return None
 
-    # ─── Scout Logic ────────────────────────────────────────
+    def _walls_blocking_factory(self, f: Robot) -> bool:
+        gs = self.gs
+        for rr in range(f.row, min(f.row + 5, gs.north + 1)):
+            for cc in range(max(0, f.col - 2), min(gs.width, f.col + 3)):
+                cell = (cc, rr)
+                if cell in gs.walls:
+                    w = gs.walls[cell]
+                    if w & NORTH and not gs.is_fixed_wall(cell, "NORTH"): return True
+        return False
 
-    def _scout(self, r: Robot, f: Optional[Robot],
-                intent: Set[Tuple[int, int]]) -> str:
+    # ─── Scout Logic ────────────────────────
+    def _scout(self, r: Robot, f: Optional[Robot], intent: Set[Tuple[int, int]]) -> str:
         gs = self.gs
 
-        t = self._transfer(r, f)
-        if t:
-            return t
+        # Transfer excess energy -> factory (economy!)
+        if r.energy > 70 and f:
+            t = self._transfer(r, f)
+            if t: return t
 
         c = self._combat_micro(r)
-        if c:
-            return c
+        if c: return c
 
-        # Return to base if full or starving
-        if (r.energy > 80 or r.energy < 30) and f:
-            if gs.manhattan(r.pos, f.pos) > 1:
-                p = astar_path(gs, r.pos, f.pos)
-                if p:
-                    return p[0]
+        if r.energy < 20 and f and gs.manhattan(r.pos, f.pos) > 1:
+            p = astar_path(gs, r.pos, f.pos)
+            if p: return p[0]
 
-        # Collect
         act = self._collect(r, intent)
-        if act:
-            return act
+        if act: return act
 
-        # Northward exploration — push hard north, wide search
-        # Early game: push to north edge to reveal map
-        push_dist = 20 if gs.step <= 30 else 12
-        for tr in (r.row + push_dist, r.row + 12, r.row + 8, r.row + 5):
-            for tc in (r.col, r.col - 4, r.col + 4, gs.width // 2, 0, gs.width - 1):
+        # Explore widely to find mining nodes
+        for tr in (r.row + 15, r.row + 10, r.row + 5):
+            for tc in (r.col, r.col - 5, r.col + 5, gs.width // 2):
                 tc = max(0, min(gs.width - 1, tc))
                 tgt = (tc, min(tr, gs.north))
                 if tgt[1] > r.row:
                     p = astar_path(gs, r.pos, tgt, optimistic=True, limit=300)
-                    if p:
-                        return p[0]
-        return A_NORTH
+                    if p: return p[0]
+        return A_N
 
-    # ─── Worker Logic ───────────────────────────────────────
-
-    def _worker(self, r: Robot, f: Optional[Robot],
-                 intent: Set[Tuple[int, int]]) -> str:
+    # ─── Worker Logic ───────────────────────
+    def _worker(self, r: Robot, f: Optional[Robot], intent: Set[Tuple[int, int]]) -> str:
         gs = self.gs
 
-        t = self._transfer(r, f)
-        if t:
-            return t
+        if r.energy > 200 and f:
+            t = self._transfer(r, f)
+            if t: return t
 
         c = self._combat_micro(r)
-        if c:
-            return c
+        if c: return c
 
-        # ── Wolf-pack: Predict & trap enemy factory ──
-        for uid, en in gs.enemy.items():
-            if en.type == T_FACTORY:
-                prev = gs.enemy_history.get(uid, en.pos)
-                dc = en.col - prev[0]
-                dr = en.row - prev[1]
-                pred = (max(0, min(gs.width - 1, en.col + dc)),
-                        max(gs.south + 1, min(gs.north, en.row + dr)))
+        if r.energy < 40 and f and gs.manhattan(r.pos, f.pos) > 1:
+            p = astar_path(gs, r.pos, f.pos)
+            if p: return p[0]
 
-                traps = [(pred[0], pred[1] + 1), (pred[0], pred[1] - 1),
-                         (pred[0] + 1, pred[1]), (pred[0] - 1, pred[1])]
-
-                for spot in traps:
-                    if not gs.in_bounds(spot) or spot in intent:
-                        continue
-                    dist = gs.manhattan(r.pos, spot)
-                    if dist <= 1:
-                        intent.add(spot)
-                        if r.pos == spot:
-                            if r.row == pred[1] + 1:
-                                return "BUILD_SOUTH"
-                            if r.row == pred[1] - 1:
-                                return "BUILD_NORTH"
-                            if r.col == pred[0] + 1:
-                                return "BUILD_WEST"
-                            if r.col == pred[0] - 1:
-                                return "BUILD_EAST"
-                            return "BUILD_NORTH"
-                    elif dist <= 5:
-                        intent.add(spot)
-                        p = astar_path(gs, r.pos, spot)
-                        if p:
-                            return p[0]
-
-        # Return to base
-        if (r.energy > 250 or r.energy < 60) and f:
-            if gs.manhattan(r.pos, f.pos) > 1:
-                p = astar_path(gs, r.pos, f.pos)
-                if p:
-                    return p[0]
-
-        # Wall removal: clear ALL walls blocking the factory's path
-        if r.energy > 120 and f:
-            # Priority 1: Remove walls BETWEEN worker and factory (clear path for scout/miner too)
-            for d in DIRS:
-                nxt = gs.step_pos(r.pos, d)
-                if nxt == f.pos:
-                    w = gs.walls.get(r.pos, 0)
-                    bit = DIR_BIT[d]
-                    if w & bit:
-                        opp = {"NORTH": "SOUTH", "SOUTH": "NORTH", "EAST": "WEST", "WEST": "EAST"}[d]
-                        return f"REMOVE_{opp}" if d in ("NORTH", "SOUTH") else f"REMOVE_{d}"
-
-            # Priority 2: Clear walls in factory's column (NORTH of factory, up to 5 rows)
+        # PRIMARY: Remove north walls blocking factory
+        if r.energy >= 100 and f:
             for rr in range(f.row, min(f.row + 5, gs.north + 1)):
                 cell = (f.col, rr)
                 if cell in gs.walls:
                     w = gs.walls[cell]
-                    if w & NORTH:
-                        if r.pos == cell:
-                            return "REMOVE_NORTH"
+                    if w & NORTH and not gs.is_fixed_wall(cell, "NORTH"):
+                        if r.pos == cell: return "REMOVE_NORTH"
                         p = astar_path(gs, r.pos, cell, limit=20)
-                        if p:
-                            return p[0]
+                        if p: return p[0]
 
-            # Priority 3: Clear lateral walls near factory (allow factory to move EAST/WEST)
             for c_off in (-1, 1):
                 nc = f.col + c_off
                 if 0 <= nc < gs.width:
@@ -790,96 +527,55 @@ class Dispatcher:
                         cell = (nc, rr)
                         if cell in gs.walls:
                             w = gs.walls[cell]
-                            if w & NORTH:
-                                if r.pos == cell:
-                                    return "REMOVE_NORTH"
+                            if w & NORTH and not gs.is_fixed_wall(cell, "NORTH"):
+                                if r.pos == cell: return "REMOVE_NORTH"
                                 p = astar_path(gs, r.pos, cell, limit=15)
-                                if p:
-                                    return p[0]
+                                if p: return p[0]
 
-            # Priority 4: Clear walls in worker's own column northward
-            for rr in range(r.row, min(r.row + 5, gs.north + 1)):
-                cell = (r.col, rr)
-                if cell in gs.walls:
-                    w = gs.walls[cell]
-                    if w & NORTH:
-                        if r.pos == cell:
-                            return "REMOVE_NORTH"
-                        p = astar_path(gs, r.pos, cell, limit=20)
-                        if p:
-                            return p[0]
-
-        # Collect
         act = self._collect(r, intent, max_ratio=0.85)
-        if act:
-            return act
+        if act: return act
 
-        tgt = (r.col, min(r.row + 3, gs.north))
-        p = astar_path(gs, r.pos, tgt, optimistic=True)
-        return p[0] if p else A_NORTH
+        if f:
+            escort = (f.col, f.row + 1)
+            if gs.in_bounds(escort) and r.pos != escort:
+                p = astar_path(gs, r.pos, escort, optimistic=True, limit=10)
+                if p: return p[0]
+        return A_N
 
-    # ─── Miner Logic ────────────────────────────────────────
-
+    # ─── Miner Logic ────────────────────────
     def _miner(self, r: Robot, intent: Set[Tuple[int, int]]) -> str:
         gs = self.gs
 
         c = self._combat_micro(r)
-        if c:
-            return c
+        if c: return c
 
-        # Transform on node
-        is_our_mine = r.pos in gs.mines and gs.mines[r.pos][2] == gs.player
-        if r.pos in gs.nodes and not is_our_mine and r.energy >= 100:
+        is_our = r.pos in gs.mines and gs.mines[r.pos][2] == gs.player
+        if r.pos in gs.nodes and not is_our and r.energy >= 100:
             return "TRANSFORM"
 
-        # Seek nearest mining node
         targets = [n for n in gs.nodes if n not in gs.mines and n not in intent]
         if targets:
             closest = min(targets, key=lambda n: gs.manhattan(r.pos, n))
             intent.add(closest)
             p = astar_path(gs, r.pos, closest)
-            if p:
-                return p[0]
+            if p: return p[0]
 
         # Return energy to factory
         f = next((r for r in gs.my.values() if r.type == T_FACTORY), None)
-        if r.energy > 400 and f:
+        if r.energy > 350 and f:
             if gs.manhattan(r.pos, f.pos) > 1:
                 p = astar_path(gs, r.pos, f.pos)
-                if p:
-                    return p[0]
+                if p: return p[0]
             t = self._transfer(r, f)
-            if t:
-                return t
+            if t: return t
 
-        # Collect
         act = self._collect(r, intent, max_ratio=0.85)
-        if act:
-            return act
+        if act: return act
 
-        # Stay near factory
         if f and gs.manhattan(r.pos, f.pos) > 3:
             p = astar_path(gs, r.pos, f.pos)
-            if p:
-                return p[0]
-
+            if p: return p[0]
         return A_IDLE
-
-
-# ═══════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════
-
-def _has_walls_near_factory(gs: GameState, f: Robot) -> bool:
-    """Check if there are removable walls in a 5-row window above the factory."""
-    for rr in range(f.row, min(f.row + 5, gs.north + 1)):
-        for cc in range(max(0, f.col - 2), min(gs.width, f.col + 3)):
-            cell = (cc, rr)
-            if cell in gs.walls:
-                w = gs.walls[cell]
-                if w & NORTH and not gs.is_fixed_wall(cell, "NORTH"):
-                    return True
-    return False
 
 
 # ═══════════════════════════════════════
@@ -902,5 +598,5 @@ def agent(obs: Any, config: Any) -> Dict[str, str]:
         if obs and hasattr(obs, 'robots'):
             for uid, data in obs.robots.items():
                 if data[4] == obs.player:
-                    fb[uid] = A_NORTH if data[0] == T_FACTORY else A_IDLE
+                    fb[uid] = A_N if data[0] == T_FACTORY else A_IDLE
         return fb
